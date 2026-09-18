@@ -49,6 +49,8 @@ func main() {
 		log.Fatalf("auto migrate failed: %v", err)
 	}
 
+	cleanupStaleMaterials(db)
+
 	seed.Run(db)
 
 	h := handlers.New(db, cfg.JWTSecret)
@@ -92,5 +94,33 @@ func main() {
 	log.Printf("DigCatalog backend listening on :%s", cfg.Port)
 	if err := r.Run(":" + cfg.Port); err != nil {
 		log.Fatal(err)
+	}
+}
+
+// cleanupStaleMaterials 清除旧逻辑遗留的“已软删材质”：它们占用 name 唯一索引，
+// 导致同名材质无法重建。仅清除无任何文物引用的记录。
+func cleanupStaleMaterials(db *gorm.DB) {
+	var staleIDs []uint
+	if err := db.Unscoped().
+		Model(&models.Material{}).
+		Where("deleted_at IS NOT NULL").
+		Pluck("id", &staleIDs).Error; err != nil {
+		log.Printf("cleanup stale materials query failed: %v", err)
+		return
+	}
+	for _, id := range staleIDs {
+		var n int64
+		if err := db.Model(&models.Find{}).Where("material_id = ?", id).Count(&n).Error; err != nil {
+			log.Printf("cleanup count material %d failed: %v", id, err)
+			continue
+		}
+		if n > 0 {
+			continue
+		}
+		if err := db.Unscoped().Delete(&models.Material{}, id).Error; err != nil {
+			log.Printf("cleanup hard delete material %d failed: %v", id, err)
+		} else {
+			log.Printf("cleaned up stale soft-deleted material id=%d", id)
+		}
 	}
 }

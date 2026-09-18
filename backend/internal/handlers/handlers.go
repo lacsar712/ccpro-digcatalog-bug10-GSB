@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"digcatalog/internal/middleware"
@@ -20,6 +22,11 @@ type Handler struct {
 
 func New(db *gorm.DB, jwtSecret string) *Handler {
 	return &Handler{DB: db, JWTSecret: jwtSecret}
+}
+
+// isDuplicateKeyErr 判断是否为唯一索引冲突（MySQL 1062）
+func isDuplicateKeyErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "Duplicate entry")
 }
 
 // ---------- Auth ----------
@@ -250,6 +257,10 @@ func (h *Handler) CreateMaterial(c *gin.Context) {
 		return
 	}
 	if err := h.DB.Create(&m).Error; err != nil {
+		if isDuplicateKeyErr(err) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "已存在同名材质"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -268,9 +279,24 @@ func (h *Handler) UpdateMaterial(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "参数无效"})
 		return
 	}
+	if req.Name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "名称必填"})
+		return
+	}
 	m.Name = req.Name
 	m.Description = req.Description
 	if err := h.DB.Save(&m).Error; err != nil {
+		if isDuplicateKeyErr(err) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "已存在同名材质"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	// 改名后同步引用文物的冗余材质名，保证展示与材质表一致
+	if err := h.DB.Model(&models.Find{}).
+		Where("material_id = ?", id).
+		Update("material_name", m.Name).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -279,9 +305,26 @@ func (h *Handler) UpdateMaterial(c *gin.Context) {
 
 func (h *Handler) DeleteMaterial(c *gin.Context) {
 	id, _ := strconv.Atoi(c.Param("id"))
-	// 不查引用直接软删；只清 material_id 不清 material_name（错误）
-	h.DB.Model(&models.Find{}).Where("material_id = ?", id).Update("material_id", nil)
-	if err := h.DB.Delete(&models.Material{}, id).Error; err != nil {
+	var material models.Material
+	if err := h.DB.First(&material, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "材质不存在"})
+		return
+	}
+	// 仍被出土文物引用时禁止删除，并返回引用数量
+	var count int64
+	if err := h.DB.Model(&models.Find{}).Where("material_id = ?", id).Count(&count).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if count > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf("该材质仍被 %d 件出土文物引用，无法删除", count),
+			"count": count,
+		})
+		return
+	}
+	// 无引用：物理删除，避免软删残留导致同名材质唯一索引冲突
+	if err := h.DB.Unscoped().Delete(&models.Material{}, id).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -326,6 +369,9 @@ func (h *Handler) ListFinds(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	for i := range finds {
+		syncMaterialName(&finds[i])
+	}
 	c.JSON(http.StatusOK, finds)
 }
 
@@ -336,6 +382,7 @@ func (h *Handler) GetFind(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "文物不存在"})
 		return
 	}
+	syncMaterialName(&find)
 	c.JSON(http.StatusOK, find)
 }
 
@@ -344,16 +391,30 @@ func (h *Handler) applyFindReq(find *models.Find, req *findReq) {
 	find.MaterialID = req.MaterialID
 	find.RegisterNo = req.RegisterNo
 	find.ArtifactType = req.ArtifactType
-	find.MaterialName = req.MaterialName
 	find.Completeness = req.Completeness
 	find.FindDate = parseDate(req.FindDate)
 	find.Description = req.Description
 	find.StorageLoc = req.StorageLoc
+	// 材质名以材质表为准，不信任前端传入：选择材质时同步名称，未选时清空
 	if find.MaterialID != nil {
 		var m models.Material
-		if err := h.DB.First(&m, *find.MaterialID).Error; err == nil {
-			find.MaterialName = m.Name
+		if err := h.DB.First(&m, *find.MaterialID).Error; err != nil {
+			find.MaterialID = nil
+			find.MaterialName = ""
+			return
 		}
+		find.MaterialName = m.Name
+	} else {
+		find.MaterialName = ""
+	}
+}
+
+// syncMaterialName 使返回的文物材质名与材质表保持一致（含改名、历史脏数据）
+func syncMaterialName(find *models.Find) {
+	if find.MaterialID != nil && find.Material != nil {
+		find.MaterialName = find.Material.Name
+	} else {
+		find.MaterialName = ""
 	}
 }
 
@@ -379,6 +440,7 @@ func (h *Handler) CreateFind(c *gin.Context) {
 		return
 	}
 	h.DB.Preload("Unit").Preload("Material").First(&find, find.ID)
+	syncMaterialName(&find)
 	c.JSON(http.StatusCreated, find)
 }
 
@@ -400,6 +462,7 @@ func (h *Handler) UpdateFind(c *gin.Context) {
 		return
 	}
 	h.DB.Preload("Unit").Preload("Material").First(&find, find.ID)
+	syncMaterialName(&find)
 	c.JSON(http.StatusOK, find)
 }
 
