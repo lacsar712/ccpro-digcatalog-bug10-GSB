@@ -1,0 +1,4 @@
+*.exe
+digcatalog
+tmp
+.git

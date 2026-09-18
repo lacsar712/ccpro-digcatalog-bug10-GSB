@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+backend/vendor/
+
+# Build outputs
+frontend/dist/
+backend/digcatalog
+backend/*.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Env / secrets
+.env
+.env.local
+*.pem
+
+# Logs
+*.log
+npm-debug.log*
+
+# Go
+backend/tmp/

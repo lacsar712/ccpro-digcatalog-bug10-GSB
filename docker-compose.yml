@@ -1,0 +1,53 @@
+services:
+  db:
+    image: mysql:8.0
+    container_name: digcatalog-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: digcatalog
+    ports:
+      - "3307:3306"
+    volumes:
+      - digcatalog_mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: digcatalog-backend
+    restart: unless-stopped
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      DB_USER: root
+      DB_PASSWORD: root
+      DB_NAME: digcatalog
+      JWT_SECRET: digcatalog-jwt-secret-change-me
+      PORT: "8080"
+    ports:
+      - "8200:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: digcatalog-frontend
+    restart: unless-stopped
+    ports:
+      - "3200:80"
+    depends_on:
+      - backend
+
+volumes:
+  digcatalog_mysql_data:
