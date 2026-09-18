@@ -46,7 +46,7 @@
             <td>{{ item.registerNo }}</td>
             <td>{{ item.unit?.code || '-' }}</td>
             <td><span class="tag">{{ item.artifactType }}</span></td>
-            <td>{{ item.materialName || '-' }}</td>
+            <td>{{ item.material?.name || '-' }}</td>
             <td>{{ item.completeness || '-' }}</td>
             <td>{{ formatDate(item.findDate) }}</td>
             <td>{{ item.storageLoc || '-' }}</td>

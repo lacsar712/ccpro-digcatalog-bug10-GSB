@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -249,6 +251,11 @@ func (h *Handler) CreateMaterial(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "名称必填"})
 		return
 	}
+	var dup models.Material
+	if err := h.DB.Where("name = ?", m.Name).First(&dup).Error; err == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "材质名称已存在"})
+		return
+	}
 	if err := h.DB.Create(&m).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -268,9 +275,32 @@ func (h *Handler) UpdateMaterial(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "参数无效"})
 		return
 	}
+	if req.Name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "名称必填"})
+		return
+	}
+	var dup models.Material
+	if err := h.DB.Where("name = ? AND id <> ?", req.Name, id).First(&dup).Error; err == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "材质名称已存在"})
+		return
+	}
+	nameChanged := m.Name != req.Name
 	m.Name = req.Name
 	m.Description = req.Description
-	if err := h.DB.Save(&m).Error; err != nil {
+	err := h.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&m).Error; err != nil {
+			return err
+		}
+		// 改名时同步文物表冗余展示字段，保证文物材质展示与材质表一致
+		if nameChanged {
+			if err := tx.Model(&models.Find{}).Where("material_id = ?", m.ID).
+				Update("material_name", m.Name).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -279,9 +309,28 @@ func (h *Handler) UpdateMaterial(c *gin.Context) {
 
 func (h *Handler) DeleteMaterial(c *gin.Context) {
 	id, _ := strconv.Atoi(c.Param("id"))
-	// 不查引用直接软删；只清 material_id 不清 material_name（错误）
-	h.DB.Model(&models.Find{}).Where("material_id = ?", id).Update("material_id", nil)
-	if err := h.DB.Delete(&models.Material{}, id).Error; err != nil {
+	var m models.Material
+	if err := h.DB.First(&m, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "材质不存在"})
+		return
+	}
+	// 仍有文物引用则禁止删除，并提示引用数量
+	var count int64
+	h.DB.Model(&models.Find{}).Where("material_id = ?", id).Count(&count)
+	if count > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("该材质仍被 %d 件文物引用，无法删除", count)})
+		return
+	}
+	err := h.DB.Transaction(func(tx *gorm.DB) error {
+		// 清理已软删文物可能遗留的悬空引用
+		if err := tx.Unscoped().Model(&models.Find{}).Where("material_id = ?", id).
+			Updates(map[string]interface{}{"material_id": nil, "material_name": ""}).Error; err != nil {
+			return err
+		}
+		// 无引用：硬删除，释放名称唯一索引，避免同名重建冲突
+		return tx.Unscoped().Delete(&models.Material{}, id).Error
+	})
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -295,7 +344,6 @@ type findReq struct {
 	MaterialID   *uint   `json:"materialId"`
 	RegisterNo   string  `json:"registerNo"`
 	ArtifactType string  `json:"artifactType"`
-	MaterialName string  `json:"materialName"`
 	Completeness string  `json:"completeness"`
 	FindDate     *string `json:"findDate"`
 	Description  string  `json:"description"`
@@ -339,22 +387,26 @@ func (h *Handler) GetFind(c *gin.Context) {
 	c.JSON(http.StatusOK, find)
 }
 
-func (h *Handler) applyFindReq(find *models.Find, req *findReq) {
+func (h *Handler) applyFindReq(find *models.Find, req *findReq) error {
 	find.UnitID = req.UnitID
 	find.MaterialID = req.MaterialID
 	find.RegisterNo = req.RegisterNo
 	find.ArtifactType = req.ArtifactType
-	find.MaterialName = req.MaterialName
 	find.Completeness = req.Completeness
 	find.FindDate = parseDate(req.FindDate)
 	find.Description = req.Description
 	find.StorageLoc = req.StorageLoc
+	// material_name 是冗余展示字段，只能由材质表派生，保证展示与材质表一致
 	if find.MaterialID != nil {
 		var m models.Material
-		if err := h.DB.First(&m, *find.MaterialID).Error; err == nil {
-			find.MaterialName = m.Name
+		if err := h.DB.First(&m, *find.MaterialID).Error; err != nil {
+			return errors.New("所选材质不存在")
 		}
+		find.MaterialName = m.Name
+	} else {
+		find.MaterialName = ""
 	}
+	return nil
 }
 
 func (h *Handler) CreateFind(c *gin.Context) {
@@ -373,7 +425,10 @@ func (h *Handler) CreateFind(c *gin.Context) {
 		return
 	}
 	var find models.Find
-	h.applyFindReq(&find, &req)
+	if err := h.applyFindReq(&find, &req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	if err := h.DB.Create(&find).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -394,7 +449,10 @@ func (h *Handler) UpdateFind(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "参数无效"})
 		return
 	}
-	h.applyFindReq(&find, &req)
+	if err := h.applyFindReq(&find, &req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	if err := h.DB.Save(&find).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
